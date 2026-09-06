@@ -323,6 +323,89 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
     return None
 
 
+def _find_ffprobe() -> Optional[str]:
+    """``ffprobe`` on PATH, else the usual Homebrew / /usr/local locations.
+
+    A gateway started by launchd (macOS) or systemd runs without the user's
+    shell PATH, so ``shutil.which`` alone misses a Homebrew ffmpeg.
+    """
+    import shutil
+
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _video_rotation(stream: Dict[str, Any]) -> int:
+    """Degrees from the legacy ``rotate`` tag or the display-matrix side data, in 0..359."""
+    raw = (stream.get("tags") or {}).get("rotate")
+    if raw is None:
+        for side in stream.get("side_data_list") or ():
+            if isinstance(side, dict) and "rotation" in side:
+                raw = side["rotation"]
+                break
+    try:
+        return int(round(float(raw))) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
+def _probe_video_attrs(path: str) -> Dict[str, int]:
+    """Best-effort ``width``/``height``/``duration`` for an outgoing video.
+
+    The Bot API treats all three as optional on ``sendVideo``, but when they
+    are omitted Telegram stores 0x0 and every client draws a square bubble
+    with the frame stretched into it -- portrait 9:16 phone videos are the
+    usual casualty. We read them locally and pass them explicitly.
+
+    Width/height are the *displayed* size: phones record landscape and tag
+    the stream with a +/-90 degree rotation, and Telegram wants the size after
+    that rotation, so the coded dimensions are swapped when the tag says so.
+    Returns ``{}`` when ffprobe is missing or the file cannot be read, and
+    the caller omits the attributes (the prior behavior). Blocking
+    (subprocess), so call it via ``asyncio.to_thread``.
+    """
+    import subprocess
+
+    ffprobe = _find_ffprobe()
+    if not ffprobe:
+        return {}
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries",
+                "stream=width,height:stream_tags=rotate:stream_side_data=rotation:format=duration",
+                "-of", "json", path,
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+        if proc.returncode != 0:
+            return {}
+        data = json.loads(proc.stdout or "{}")
+    except Exception:
+        return {}
+
+    attrs: Dict[str, int] = {}
+    stream = (data.get("streams") or [{}])[0]
+    try:
+        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    if width > 0 and height > 0:
+        if _video_rotation(stream) % 180 == 90:
+            width, height = height, width
+        attrs["width"], attrs["height"] = width, height
+    duration = _coerce_duration_seconds((data.get("format") or {}).get("duration"))
+    if duration is not None:
+        attrs["duration"] = duration
+    return attrs
+
+
 def telegram_deps_present() -> bool:
     """PASSIVE probe: is python-telegram-bot importable right now?
 
@@ -8323,12 +8406,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
+            # Without width/height Telegram draws a square bubble and stretches
+            # the frame into it; declare the displayed size (see _probe_video_attrs).
+            video_attrs = await asyncio.to_thread(_probe_video_attrs, video_path)
             with open(video_path, "rb") as f:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_video,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "video": f,
+                        **video_attrs,
+                        "supports_streaming": True,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,

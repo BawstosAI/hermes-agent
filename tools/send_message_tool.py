@@ -1620,6 +1620,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 media_kwargs["duration"] = duration
                         except Exception:
                             pass
+                    elif ext in _VIDEO_EXTS:
+                        # Without width/height Telegram draws a square bubble and
+                        # stretches the frame into it; declare the displayed size.
+                        try:
+                            from plugins.platforms.telegram.adapter import _probe_video_attrs
+                            media_kwargs.update(await asyncio.to_thread(_probe_video_attrs, media_path))
+                            media_kwargs["supports_streaming"] = True
+                        except Exception:
+                            pass
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(
