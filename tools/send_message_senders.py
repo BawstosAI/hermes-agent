@@ -203,6 +203,12 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
             duration = await asyncio.to_thread(_probe_voice_duration_seconds, media_path)
             if duration is not None:
                 media_kwargs["duration"] = duration
+    elif ext in _VIDEO_EXTS:
+        # Telegram needs the displayed dimensions, including phone rotation.
+        media_kwargs["supports_streaming"] = True
+        with contextlib.suppress(Exception):
+            from plugins.platforms.telegram.adapter import _probe_video_attrs
+            media_kwargs.update(await asyncio.to_thread(_probe_video_attrs, media_path))
     with open(media_path, "rb") as f:
         try:
             return await _telegram_send_media(bot, chat_id, f, ext, is_voice, force_document, **media_kwargs)
